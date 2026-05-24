@@ -1,0 +1,124 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Initialize Local Cluster Config') {
+            steps {
+                sh '''
+                mkdir -p .kube
+                sudo cp /etc/rancher/k3s/k3s.yaml .kube/config
+                sudo chown -R jenkins:jenkins .kube/
+                chmod 600 .kube/config
+                '''
+            }
+        }
+
+        stage('Create Deployment Manifests') {
+            steps {
+                sh '''
+                mkdir -p k8s
+                cat << 'EOF' > k8s/keycloak.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: default
+  labels:
+    app: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:24.0
+        command: ["/opt/keycloak/bin/kc.sh"]
+        args: ["start-dev"]
+        
+        env:
+        - name: KEYCLOAK_ADMIN
+          value: "admin"
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          value: "admin123"
+        
+        # --- HTTP, PROXY, AND SAMESITE COOKIE FIXES ---
+        - name: KC_HTTP_ENABLED
+          value: "true"
+        - name: KC_HOSTNAME_STRICT
+          value: "false"
+        - name: KC_HOSTNAME_STRICT_HTTPS
+          value: "false"
+        - name: KC_PROXY
+          value: "edge"
+        - name: KC_FEATURES
+          value: "hostname:v1"
+        
+        # --- DIRECT CLOUD SQL PUBLIC IP ROUTING CONFIGURATION ---
+        - name: KC_DB
+          value: "mysql"
+        - name: KC_DB_URL
+          value: "jdbc:mysql://your_db_ip:3306/keycloakdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+        - name: KC_DB_USERNAME
+          value: "admin"
+        - name: KC_DB_PASSWORD
+          value: "password"
+
+        # --- ALLOCATED HOST VM HARDWARE CAPACITY ---
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1024Mi"
+            cpu: "1000m"
+        ports:
+        - containerPort: 8080
+          name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-service
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: keycloak
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    nodePort: 30080
+EOF
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes Node') {
+            steps {
+                sh '''
+                export KUBECONFIG="${WORKSPACE}/.kube/config"
+                kubectl apply -f k8s/keycloak.yaml
+                '''
+            }
+        }
+
+        stage('Verify Rollout Status') {
+            steps {
+                sh '''
+                export KUBECONFIG="${WORKSPACE}/.kube/config"
+                # Force reset the pod cycle to guarantee instant environment reload
+                kubectl rollout restart deployment/keycloak
+                kubectl rollout status deployment/keycloak --timeout=150s
+                kubectl get pods -l app=keycloak
+                '''
+            }
+        }
+    }
+}
